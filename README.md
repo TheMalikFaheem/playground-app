@@ -441,7 +441,7 @@ docker compose down -v    # -v removes the volume (fresh DB next time)
 
 ### Phase 4 — CI/CD Pipeline (Jenkins)
 
-> **Goal:** Automate test → build → push on every commit.
+> **Goal:** Automate test → build → deploy on every commit — everything runs locally, no Docker Hub needed.
 
 **Files to create:**
 
@@ -456,8 +456,8 @@ pipeline {
     agent any
 
     environment {
-        DOCKER_IMAGE = 'yourdockerhubuser/devops-playground'
-        DOCKER_TAG   = "${env.BUILD_NUMBER}"
+        IMAGE_NAME = 'devops-playground'
+        IMAGE_TAG  = "${env.BUILD_NUMBER}"
     }
 
     stages {
@@ -481,54 +481,96 @@ pipeline {
 
         stage('Build Docker Image') {
             steps {
-                sh "docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} ."
-                sh "docker tag ${DOCKER_IMAGE}:${DOCKER_TAG} ${DOCKER_IMAGE}:latest"
+                echo "Building local Docker image: ${IMAGE_NAME}:${IMAGE_TAG}"
+                sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
+                sh "docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest"
             }
         }
 
-        stage('Push to Docker Hub') {
+        stage('Deploy Containers') {
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'dockerhub-credentials',
-                    usernameVariable: 'DOCKER_USER',
-                    passwordVariable: 'DOCKER_PASS'
-                )]) {
-                    sh 'echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin'
-                    sh "docker push ${DOCKER_IMAGE}:${DOCKER_TAG}"
-                    sh "docker push ${DOCKER_IMAGE}:latest"
-                }
+                echo 'Stopping any existing containers...'
+                sh 'docker compose down || true'
+
+                echo 'Starting app + database containers...'
+                sh 'docker compose up -d --build'
+
+                echo 'Waiting for database to be ready...'
+                sh '''
+                    for i in $(seq 1 30); do
+                        docker compose exec -T db pg_isready -U postgres && break
+                        echo "Waiting for DB... ($i/30)"
+                        sleep 2
+                    done
+                '''
             }
         }
 
-        stage('Cleanup') {
+        stage('Run Migrations & Seed') {
             steps {
-                sh "docker rmi ${DOCKER_IMAGE}:${DOCKER_TAG} || true"
-                sh "docker rmi ${DOCKER_IMAGE}:latest || true"
+                echo 'Running database migrations...'
+                sh 'docker compose exec -T app node src/db/migrate.js'
+
+                echo 'Seeding demo data...'
+                sh 'docker compose exec -T app node src/db/seed.js'
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                echo 'Verifying health endpoints...'
+                sh '''
+                    sleep 3
+                    curl -f http://localhost:3000/health || exit 1
+                    echo "\n✅ /health is OK"
+
+                    curl -f http://localhost:3000/ready || exit 1
+                    echo "\n✅ /ready is OK (DB connected)"
+
+                    curl -f http://localhost:3000/version || exit 1
+                    echo "\n✅ /version is OK"
+                '''
             }
         }
     }
 
     post {
-        always {
-            cleanWs()
-        }
         success {
-            echo '✅ Pipeline completed successfully!'
+            echo '✅ Pipeline completed successfully! App is running at http://localhost:3000'
         }
         failure {
-            echo '❌ Pipeline failed — check the logs above.'
+            echo '❌ Pipeline failed — stopping containers...'
+            sh 'docker compose down || true'
+        }
+        always {
+            cleanWs()
         }
     }
 }
 ```
 
+**What the pipeline does:**
+
+```
+ Checkout → Install Deps → Run Tests → Build Image (local) → Deploy via Docker Compose → Run Migrations → Verify Health
+```
+
+1. **Checkout** — pulls latest code from your repository
+2. **Install Dependencies** — runs `npm ci` for a clean install
+3. **Run Tests** — executes Jest test suite (fails fast if tests break)
+4. **Build Docker Image** — builds `devops-playground:latest` locally (no push anywhere)
+5. **Deploy Containers** — runs `docker compose up -d` to start app + PostgreSQL
+6. **Run Migrations & Seed** — creates tables and inserts demo data
+7. **Verify Deployment** — hits `/health`, `/ready`, `/version` to confirm everything works
+
 **Jenkins Setup Checklist:**
 
-- [ ] Install Jenkins (locally or via Docker: `docker run -p 8080:8080 jenkins/jenkins:lts`)
-- [ ] Install required plugins: **Docker Pipeline**, **NodeJS**, **Pipeline**
-- [ ] Add Docker Hub credentials in Jenkins (ID: `dockerhub-credentials`)
+- [ ] Install Jenkins locally (or via Docker: `docker run -p 8080:8080 -v /var/run/docker.sock:/var/run/docker.sock jenkins/jenkins:lts`)
+- [ ] Install required plugins: **Pipeline**, **NodeJS**
+- [ ] Ensure Docker is accessible from Jenkins (Jenkins user must be in the `docker` group)
 - [ ] Create a "Pipeline" job pointing to your repo's `Jenkinsfile`
 - [ ] Trigger a build and verify all stages pass
+- [ ] After success, open `http://localhost:3000` to see the running app
 
 ---
 
